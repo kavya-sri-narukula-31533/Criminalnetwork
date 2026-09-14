@@ -217,6 +217,21 @@ def save_users(users):
     upsert_users(users)
 
 
+def _logout():
+    """Clear the authenticated session and return to the login screen."""
+    for key in list(st.session_state.keys()):
+        st.session_state.pop(key, None)
+
+    st.session_state.authenticated = False
+
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+    st.rerun()
+
+
 # --------------------------- Face authentication ---------------------------
 
 def _camera_bytes_to_face(camera_file):
