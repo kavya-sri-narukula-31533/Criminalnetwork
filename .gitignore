@@ -55,3 +55,8 @@ data/processed/user_accounts.json
 # ==============================
 data/raw/fingerprint_images/
 data/raw/fingerprint_image_registry.csv
+# ==============================
+# Face authentication data
+# ==============================
+data/processed/face_data/
+data/raw/face_data/

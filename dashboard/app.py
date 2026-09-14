@@ -12,6 +12,8 @@ import re
 from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
+import cv2
+import sys
 import textwrap
 import base64
 import hmac
@@ -40,6 +42,19 @@ st.set_page_config(
 APP_DIR = Path(__file__).resolve().parent
 # Supports both the original dashboard/app.py structure and root-level app.py.
 BASE_DIR = APP_DIR.parent if (APP_DIR.parent / "data").exists() else APP_DIR
+
+# Shared authentication storage (MongoDB).
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+from database.mongodb import (
+    get_all_users,
+    upsert_user,
+    upsert_users,
+    get_face_image,
+    save_face_image,
+    delete_face,
+    mongodb_is_available,
+)
 DATA_DIR = BASE_DIR / "data" / "raw"
 PROCESSED_DIR = BASE_DIR / "data" / "processed"
 
@@ -73,7 +88,11 @@ FILES = {
 # Category B = Police / Investigator (operational access)
 # ============================================================
 
-USERS_FILE = PROCESSED_DIR / "user_accounts.json"
+# User accounts and face data are stored in MongoDB for cross-device deployment.
+
+# Face-authentication storage. Face images stay outside the Git source tree's
+# normal code files and are created automatically on the machine/server that
+# runs the application.
 
 ROLE_PAGES = {
     "Admin": [label for _, items in [
@@ -103,8 +122,10 @@ ROLE_LABEL = {
     "Investigator": "Category B — Investigator",
 }
 
+
 def _password_hash(password):
     return hashlib.sha256(str(password).encode("utf-8")).hexdigest()
+
 
 def _auth_secret():
     """Return a persistent local signing secret for browser session tokens."""
@@ -118,6 +139,7 @@ def _auth_secret():
     secret_file.write_text(value, encoding="utf-8")
     return value.encode("utf-8")
 
+
 def _make_auth_token(username, role, password_hash, ttl_seconds=12 * 60 * 60):
     payload = {
         "u": username,
@@ -130,6 +152,7 @@ def _make_auth_token(username, role, password_hash, ttl_seconds=12 * 60 * 60):
     body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
     sig = hmac.new(_auth_secret(), body.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{body}.{sig}"
+
 
 def _restore_auth_from_token(token):
     """Restore authentication after a browser navigation/reconnect."""
@@ -163,9 +186,8 @@ def _restore_auth_from_token(token):
     except Exception:
         return False
 
+
 def _default_users():
-    # Official CrimeSphere demo accounts. Passwords are stored as SHA-256 hashes,
-    # not in plaintext. These replace all previous/legacy login accounts.
     return {
         "kavya": {"user_id": "USR-KAVYA", "full_name": "Kavya", "email": "kavya@crimesphere.ai", "password_hash": _password_hash("Kavya@0512"), "role": "Admin", "active": True, "built_in": True},
         "stephen": {"user_id": "USR-STEPHEN", "full_name": "Stephen", "email": "stephen@crimesphere.ai", "password_hash": _password_hash("Stephen@0512"), "role": "Admin", "active": True, "built_in": True},
@@ -175,78 +197,378 @@ def _default_users():
         "vasu": {"user_id": "USR-VASU", "full_name": "Vasu", "email": "vasu@crimesphere.ai", "password_hash": _password_hash("Vasu@2026"), "role": "Investigator", "active": True, "built_in": True},
     }
 
+
 def load_users():
-    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if not USERS_FILE.exists():
-        data = _default_users()
-        USERS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        return data
+    """Load shared user accounts from MongoDB and seed demo users when empty."""
     try:
-        data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) and data else _default_users()
-    except Exception:
-        return _default_users()
+        users = get_all_users()
+        if not users:
+            defaults = _default_users()
+            upsert_users(defaults)
+            users = get_all_users()
+        return users
+    except Exception as exc:
+        st.error(f"MongoDB authentication storage is unavailable: {exc}")
+        return {}
+
 
 def save_users(users):
-    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    USERS_FILE.write_text(json.dumps(users, indent=2), encoding="utf-8")
+    """Persist user account changes to MongoDB."""
+    upsert_users(users)
 
-def _logout():
-    for key in list(st.session_state.keys()):
-        st.session_state.pop(key, None)
-    st.session_state.authenticated = False
+
+# --------------------------- Face authentication ---------------------------
+
+def _camera_bytes_to_face(camera_file):
+    """Read a Streamlit camera capture, detect one face, and normalize it.
+
+    Returns:
+        (normalized_grayscale_face, None) on success
+        (None, error_message) on failure
+    """
+    if camera_file is None:
+        return None, "Please capture a face using the laptop camera."
+
     try:
-        st.query_params.clear()
-    except Exception:
-        pass
+        raw = camera_file.getvalue()
+        if not raw:
+            return None, "The camera capture is empty. Please capture the photo again."
+
+        image = cv2.imdecode(
+            np.frombuffer(raw, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+
+        if image is None:
+            return None, "The camera image could not be read."
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        cascade_path = str(
+            BASE_DIR / "models" / "haarcascade_frontalface_default.xml"
+        )
+        detector = cv2.CascadeClassifier(cascade_path)
+
+        if detector.empty():
+            return None, "OpenCV face detector could not be loaded."
+
+        faces = detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(80, 80),
+        )
+
+        if len(faces) == 0:
+            return None, (
+                "No face detected. Please face the camera directly, "
+                "use good lighting, and capture the photo again."
+            )
+
+        # Use the largest detected face. For authentication we expect one
+        # person to be visible in the camera frame.
+        x, y, w, h = max(
+            faces,
+            key=lambda box: int(box[2]) * int(box[3]),
+        )
+
+        # Add a small margin so the normalized image contains more of the
+        # facial region while remaining consistent between enrollment/login.
+        margin_x = int(w * 0.20)
+        margin_y = int(h * 0.25)
+
+        x1 = max(0, x - margin_x)
+        y1 = max(0, y - margin_y)
+        x2 = min(gray.shape[1], x + w + margin_x)
+        y2 = min(gray.shape[0], y + h + margin_y)
+
+        face = gray[y1:y2, x1:x2]
+
+        if face.size == 0:
+            return None, "The detected face region is invalid. Please try again."
+
+        face = cv2.resize(face, (200, 200), interpolation=cv2.INTER_AREA)
+        face = cv2.equalizeHist(face)
+
+        return face, None
+
+    except Exception as exc:
+        return None, f"Unable to process the camera image: {exc}"
+
+
+def _save_registered_face(username, camera_file):
+    """Detect and store a normalized enrollment face image in MongoDB."""
+    face, error = _camera_bytes_to_face(camera_file)
+    if error:
+        return False, error
+
+    try:
+        ok, encoded = cv2.imencode(".jpg", face, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        if not ok:
+            return False, "The face image could not be encoded."
+        save_face_image(username, encoded.tobytes())
+        return True, None
+    except Exception as exc:
+        return False, f"Could not save face data to MongoDB: {exc}"
+
+
+def _verify_registered_face(username, camera_file):
+    """Compare a login camera image against the user's enrolled face from MongoDB."""
+    stored_bytes = get_face_image(username)
+    if not stored_bytes:
+        return False, "No face is enrolled for this account."
+
+    live_face, error = _camera_bytes_to_face(camera_file)
+    if error:
+        return False, error
+
+    try:
+        if not hasattr(cv2, "face") or not hasattr(cv2.face, "LBPHFaceRecognizer_create"):
+            return False, (
+                "Face recognition dependency is missing. Install "
+                "opencv-contrib-python in this project's virtual environment."
+            )
+
+        enrolled = cv2.imdecode(
+            np.frombuffer(stored_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
+        )
+        if enrolled is None:
+            return False, "The enrolled face image could not be read from MongoDB."
+
+        recognizer = cv2.face.LBPHFaceRecognizer_create(
+            radius=1, neighbors=8, grid_x=8, grid_y=8
+        )
+        recognizer.train([enrolled], np.array([1], dtype=np.int32))
+        _, confidence = recognizer.predict(live_face)
+
+        matched = float(confidence) <= 75.0
+        if matched:
+            return True, f"Face verified (match distance {float(confidence):.1f})."
+        return False, "Face does not match the enrolled account."
+    except Exception as exc:
+        return False, f"Face verification failed: {exc}"
+
+
+def _finish_login(clean_username, record):
+    role = record.get("role", "Police")
+    if role not in ROLE_PAGES:
+        st.error("Account has an invalid role. Contact an administrator.")
+        return
+    st.session_state.authenticated = True
+    st.session_state.username = clean_username
+    st.session_state.role = role
+    st.session_state.category = ROLE_CATEGORY[role]
+    st.session_state.page = "Dashboard"
+    st.session_state.auth_token = _make_auth_token(
+        clean_username, role, record.get("password_hash", "")
+    )
+    st.query_params["auth"] = st.session_state.auth_token
+    st.query_params["page"] = "Dashboard"
     st.rerun()
-    
+
+
+def _validate_registration(username, email, password, confirm_password, role):
+    username = username.strip().lower()
+    email = email.strip().lower()
+
+    if not re.fullmatch(r"[a-z0-9_.-]{3,32}", username):
+        return False, "Username must be 3–32 characters and use only letters, numbers, _, ., or -."
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return False, "Please enter a valid email address."
+    if len(password) < 8:
+        return False, "Password must contain at least 8 characters."
+    if password != confirm_password:
+        return False, "Passwords do not match."
+    if role not in ROLE_PAGES:
+        return False, "Please select a valid role."
+    return True, ""
+
+
 def render_login():
     st.markdown("""
     <style>
     [data-testid="stAppViewContainer"] .main .block-container {
-        max-width: 560px !important; margin: 0 auto !important; padding-top: 9vh !important;
+        max-width: 720px !important; margin: 0 auto !important; padding-top: 7vh !important;
     }
-    .login-card { background:#fff; border:1px solid #d7d2c8; border-radius:14px; padding:38px 42px; box-shadow:0 18px 50px rgba(25,35,45,.10); }
+    .login-card { background:#fff; border:1px solid #d7d2c8; border-radius:14px; padding:32px 38px; box-shadow:0 18px 50px rgba(25,35,45,.10); }
     .login-brand { font-size:30px; font-weight:800; color:#243746; letter-spacing:-1px; }
-    .login-sub { color:#68737b; margin:4px 0 24px; font-size:13px; }
-    .login-role { display:inline-block; background:#f3f1ec; border:1px solid #d7d2c8; border-radius:999px; padding:6px 10px; font-size:11px; color:#68737b; margin-bottom:20px; }
+    .login-sub { color:#68737b; margin:4px 0 20px; font-size:13px; }
+    .login-role { display:inline-block; background:#f3f1ec; border:1px solid #d7d2c8; border-radius:999px; padding:6px 10px; font-size:11px; color:#68737b; margin-bottom:8px; }
     .login-note { margin-top:18px; padding:12px; background:#faf9f6; border:1px solid #e7e3da; border-radius:8px; font-size:11px; color:#68737b; line-height:1.5; }
     </style>
     <div class="login-card">
       <div class="login-brand">CrimeSphere AI</div>
       <div class="login-sub">Investigation Intelligence &amp; Criminal Network Analysis</div>
-      <div class="login-role">Secure Role-Based Access</div>
+      <div class="login-role">Password + Camera Face Verification</div>
     </div>
     """, unsafe_allow_html=True)
-    with st.form("crimesphere_login", clear_on_submit=False):
-        username = st.text_input("Username", placeholder="Enter your username")
-        password = st.text_input("Password", type="password", placeholder="Enter your password")
-        submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
-    if submitted:
-        users = load_users()
-        record = users.get(username.strip().lower())
-        if record and record.get("active", True) and record.get("password_hash") == _password_hash(password):
-            role = record.get("role", "Police")
-            if role not in ROLE_PAGES:
-                st.error("Account has an invalid role. Contact an administrator.")
-                return
+
+    if not mongodb_is_available():
+        st.warning("Shared MongoDB is not connected. Authentication data cannot be shared across devices until the database connection is configured.")
+
+    login_tab, register_tab = st.tabs(["🔐 Sign in", "📝 Create account"])
+
+    with login_tab:
+        st.markdown("### Secure Sign in")
+        with st.form("crimesphere_login", clear_on_submit=False):
+            username = st.text_input("Username", placeholder="Enter your username", key="login_username")
+            password = st.text_input("Password", type="password", placeholder="Enter your password", key="login_password")
+            camera = st.camera_input(
+                "Camera — capture your face",
+                key="login_face_camera",
+                help="Allow camera access and capture a clear, front-facing photo."
+            )
+            submitted = st.form_submit_button(
+                "Sign in with face verification",
+                type="primary",
+                use_container_width=True
+            )
+
+        if submitted:
             clean_username = username.strip().lower()
-            st.session_state.authenticated = True
-            st.session_state.username = clean_username
-            st.session_state.role = role
-            st.session_state.category = ROLE_CATEGORY[role]
-            st.session_state.page = "Dashboard"
-            st.session_state.auth_token = _make_auth_token(clean_username, role, record.get("password_hash", ""))
-            # Keep authentication in the same browser tab. This token is only
-            # used to restore the Streamlit session after a navigation/reconnect.
-            st.query_params["auth"] = st.session_state.auth_token
-            st.query_params["page"] = "Dashboard"
-            st.rerun()
-        else:
-            st.error("Invalid username/password or inactive account.")
-    st.markdown("""<div class="login-note"><b>Access categories</b><br>Category A: Administrators have full application access.<br>Category B: Police and Investigators have operational investigation access; administration/settings are restricted.</div>""", unsafe_allow_html=True)
-    st.caption("For the first local run, demo accounts are created automatically. Change their passwords before deployment.")
+            users = load_users()
+            record = users.get(clean_username)
+
+            if not record or not record.get("active", True):
+                st.error("Invalid username/password or inactive account.")
+            elif record.get("password_hash") != _password_hash(password):
+                st.error("Invalid username/password.")
+            else:
+                # Existing built-in demo users may not have an enrolled face.
+                # They remain usable with password-only login. New accounts
+                # always have face data because registration requires the camera.
+                if record.get("face_enrolled") or get_face_image(clean_username):
+                    matched, message = _verify_registered_face(clean_username, camera)
+                    if matched:
+                        st.success(message)
+                        _finish_login(clean_username, record)
+                    else:
+                        st.error(message)
+                else:
+                    st.warning(
+                        "This account has no enrolled face yet. "
+                        "Password-only demo login is allowed for this built-in account. "
+                        "Create a new account to enable face verification."
+                    )
+                    _finish_login(clean_username, record)
+
+        st.markdown(
+            '<div class="login-note"><b>How it works</b><br>'
+            '1. Enter your username and password. '
+            '2. Capture your face using the laptop camera. '
+            '3. CrimeSphere detects the face and compares it with the enrolled face. '
+            '4. Access is granted only after successful verification.<br><br>'
+            '<b>Privacy:</b> the application stores an encrypted/protected face image in the configured MongoDB database for each enrolled account. '
+            'Use this only with authorized users and obtain appropriate consent.</div>',
+            unsafe_allow_html=True,
+        )
+
+    with register_tab:
+        st.markdown("### Create CrimeSphere account")
+        st.caption(
+            "Registration requires a camera photo so the account can use face verification at login."
+        )
+        with st.form("crimesphere_registration", clear_on_submit=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                reg_user_id = st.text_input("User ID", placeholder="e.g. USR-001", key="reg_user_id")
+                reg_username = st.text_input("Username", placeholder="e.g. investigator01", key="reg_username")
+                reg_full_name = st.text_input("Full name", placeholder="Enter full name", key="reg_full_name")
+            with c2:
+                reg_email = st.text_input("Email", placeholder="name@example.com", key="reg_email")
+                reg_role = st.selectbox(
+                    "Role",
+                    ["Police", "Investigator", "Admin"],
+                    format_func=lambda r: ROLE_LABEL[r],
+                    key="reg_role",
+                )
+            reg_password = st.text_input("Password", type="password", key="reg_password")
+            reg_confirm = st.text_input("Confirm password", type="password", key="reg_confirm")
+            reg_camera = st.camera_input(
+                "Camera — capture enrollment photo",
+                key="register_face_camera",
+                help="Use good lighting, look directly at the camera, and keep one face visible."
+            )
+            reg_submitted = st.form_submit_button(
+                "Create account + enroll face",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if reg_submitted:
+            users = load_users()
+            clean_username = reg_username.strip().lower()
+            clean_email = reg_email.strip().lower()
+            clean_user_id = reg_user_id.strip()
+
+            if not reg_full_name.strip():
+                st.error("Full name is required.")
+            elif not clean_user_id:
+                st.error("User ID is required.")
+            elif clean_username in users:
+                st.error("Username already exists.")
+            elif any(str(u.get("user_id", "")).strip().lower() == clean_user_id.lower() for u in users.values()):
+                st.error("User ID already exists.")
+            elif any(str(u.get("email", "")).strip().lower() == clean_email for u in users.values()):
+                st.error("Email already exists.")
+            else:
+                valid, message = _validate_registration(
+                    clean_username, clean_email, reg_password, reg_confirm, reg_role
+                )
+                if not valid:
+                    st.error(message)
+                elif reg_camera is None:
+                    st.error("Camera capture is required for face enrollment.")
+                else:
+                    # Verify that a face can actually be detected before
+                    # creating the account.
+                    face, face_error = _camera_bytes_to_face(reg_camera)
+                    if face_error:
+                        st.error(face_error)
+                    else:
+                        # Store the face first. The account is only created after
+                        # biometric enrollment succeeds, so we never leave a
+                        # MongoDB user record without its required face data.
+                        ok, save_error = _save_registered_face(
+                            clean_username,
+                            reg_camera,
+                        )
+
+                        if not ok:
+                            st.error(save_error)
+                        else:
+                            users[clean_username] = {
+                                "user_id": clean_user_id,
+                                "full_name": reg_full_name.strip(),
+                                "email": clean_email,
+                                "password_hash": _password_hash(reg_password),
+                                "role": reg_role,
+                                "active": True,
+                                "built_in": False,
+                                "face_enrolled": True,
+                                "face_enrolled_at": datetime.now().isoformat(timespec="seconds"),
+                            }
+
+                            try:
+                                save_users(users)
+                                st.success(
+                                    f"Account '{clean_username}' created successfully. "
+                                    "You can now sign in using password + face verification."
+                                )
+                            except Exception as exc:
+                                # If account creation fails after face storage,
+                                # remove the biometric record to keep the two stores consistent.
+                                try:
+                                    delete_face(clean_username)
+                                except Exception:
+                                    pass
+                                st.error(f"Account could not be created: {exc}")
+
+    st.caption(
+        "For production deployment, use HTTPS, secure biometric storage, a proper password "
+        "hash (Argon2/bcrypt), and a managed database/object store rather than local files."
+    )
+
 
 # Authenticate before loading the investigation workspace.
 # If the browser reconnects after clicking a module, restore the same logged-in
