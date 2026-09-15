@@ -54,6 +54,9 @@ from database.mongodb import (
     save_face_image,
     delete_face,
     mongodb_is_available,
+    create_notification,
+    get_notifications,
+    mark_notification_read,
 )
 DATA_DIR = BASE_DIR / "data" / "raw"
 PROCESSED_DIR = BASE_DIR / "data" / "processed"
@@ -122,6 +125,9 @@ ROLE_LABEL = {
     "Investigator": "Category B — Investigator",
 }
 
+ADMIN_DEPARTMENTS = ["Police Department", "CBI Department"]
+ROLE_DEPARTMENT = {"Police": "Police Department", "Investigator": "CBI Department"}
+
 
 def _password_hash(password):
     return hashlib.sha256(str(password).encode("utf-8")).hexdigest()
@@ -173,6 +179,8 @@ def _restore_auth_from_token(token):
         record = users.get(username)
         if not record or not record.get("active", True):
             return False
+        if str(record.get("status", "APPROVED")).upper() != "APPROVED":
+            return False
         if record.get("role") != role or record.get("password_hash") != payload.get("p"):
             return False
         if role not in ROLE_PAGES:
@@ -188,25 +196,14 @@ def _restore_auth_from_token(token):
 
 
 def _default_users():
-    return {
-        "kavya": {"user_id": "USR-KAVYA", "full_name": "Kavya", "email": "kavya@crimesphere.ai", "password_hash": _password_hash("Kavya@0512"), "role": "Admin", "active": True, "built_in": True},
-        "stephen": {"user_id": "USR-STEPHEN", "full_name": "Stephen", "email": "stephen@crimesphere.ai", "password_hash": _password_hash("Stephen@0512"), "role": "Admin", "active": True, "built_in": True},
-        "suhaib": {"user_id": "USR-SUHAIB", "full_name": "Suhaib", "email": "suhaib@crimesphere.ai", "password_hash": _password_hash("Suhaib@2026"), "role": "Police", "active": True, "built_in": True},
-        "sameera": {"user_id": "USR-SAMEERA", "full_name": "Sameera", "email": "sameera@crimesphere.ai", "password_hash": _password_hash("Sameera@2026"), "role": "Police", "active": True, "built_in": True},
-        "lavanya": {"user_id": "USR-LAVANYA", "full_name": "Lavanya", "email": "lavanya@crimesphere.ai", "password_hash": _password_hash("Lavanya@2026"), "role": "Investigator", "active": True, "built_in": True},
-        "vasu": {"user_id": "USR-VASU", "full_name": "Vasu", "email": "vasu@crimesphere.ai", "password_hash": _password_hash("Vasu@2026"), "role": "Investigator", "active": True, "built_in": True},
-    }
+    """No accounts are created automatically. Users must register explicitly."""
+    return {}
 
 
 def load_users():
-    """Load shared user accounts from MongoDB and seed demo users when empty."""
+    """Load shared user accounts from MongoDB without recreating deleted admins."""
     try:
-        users = get_all_users()
-        if not users:
-            defaults = _default_users()
-            upsert_users(defaults)
-            users = get_all_users()
-        return users
+        return get_all_users()
     except Exception as exc:
         st.error(f"MongoDB authentication storage is unavailable: {exc}")
         return {}
@@ -217,19 +214,37 @@ def save_users(users):
     upsert_users(users)
 
 
-def _logout():
-    """Clear the authenticated session and return to the login screen."""
-    for key in list(st.session_state.keys()):
-        st.session_state.pop(key, None)
+def _admin_count(users):
+    return sum(1 for rec in users.values() if rec.get("role") == "Admin" and str(rec.get("status", "APPROVED")).upper() != "REJECTED")
 
-    st.session_state.authenticated = False
 
-    try:
-        st.query_params.clear()
-    except Exception:
-        pass
+def _department_admin_exists(users, department, exclude_username=None):
+    return any(
+        uname != exclude_username
+        and rec.get("role") == "Admin"
+        and rec.get("department") == department
+        and str(rec.get("status", "APPROVED")).upper() != "REJECTED"
+        for uname, rec in users.items()
+    )
 
-    st.rerun()
+
+def _find_department_admin(users, department):
+    for uname, rec in users.items():
+        if (rec.get("role") == "Admin"
+                and rec.get("department") == department
+                and rec.get("active", True)
+                and str(rec.get("status", "APPROVED")).upper() == "APPROVED"):
+            return uname
+    return None
+
+
+def _pending_status_message(record):
+    status = str(record.get("status", "APPROVED")).upper()
+    if status == "PENDING":
+        return f"Your registration is pending approval by {record.get('approval_admin') or 'the department administrator'}."
+    if status == "REJECTED":
+        return "Your registration was rejected. Please contact the responsible administrator."
+    return ""
 
 
 # --------------------------- Face authentication ---------------------------
@@ -259,10 +274,10 @@ def _camera_bytes_to_face(camera_file):
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        cascade_path = str(
-            BASE_DIR / "models" / "haarcascade_frontalface_default.xml"
-        )
-        detector = cv2.CascadeClassifier(cascade_path)
+        # Use the Haar cascade bundled with the CrimeSphere project.
+        # This is portable across teammates' machines and deployments.
+        cascade_path = BASE_DIR / "models" / "haarcascade_frontalface_default.xml"
+        detector = cv2.CascadeClassifier(str(cascade_path))
 
         if detector.empty():
             return None, "OpenCV face detector could not be loaded."
@@ -369,23 +384,22 @@ def _finish_login(clean_username, record):
     if role not in ROLE_PAGES:
         st.error("Account has an invalid role. Contact an administrator.")
         return
+    if str(record.get("status", "APPROVED")).upper() != "APPROVED":
+        st.error(_pending_status_message(record) or "This account is not approved for login.")
+        return
     st.session_state.authenticated = True
     st.session_state.username = clean_username
     st.session_state.role = role
     st.session_state.category = ROLE_CATEGORY[role]
     st.session_state.page = "Dashboard"
-    st.session_state.auth_token = _make_auth_token(
-        clean_username, role, record.get("password_hash", "")
-    )
+    st.session_state.auth_token = _make_auth_token(clean_username, role, record.get("password_hash", ""))
     st.query_params["auth"] = st.session_state.auth_token
     st.query_params["page"] = "Dashboard"
     st.rerun()
 
 
 def _validate_registration(username, email, password, confirm_password, role):
-    username = username.strip().lower()
-    email = email.strip().lower()
-
+    username = username.strip().lower(); email = email.strip().lower()
     if not re.fullmatch(r"[a-z0-9_.-]{3,32}", username):
         return False, "Username must be 3–32 characters and use only letters, numbers, _, ., or -."
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
@@ -403,7 +417,7 @@ def render_login():
     st.markdown("""
     <style>
     [data-testid="stAppViewContainer"] .main .block-container {
-        max-width: 720px !important; margin: 0 auto !important; padding-top: 7vh !important;
+        max-width: 900px !important; margin: 0 auto !important; padding-top: 7vh !important;
     }
     .login-card { background:#fff; border:1px solid #d7d2c8; border-radius:14px; padding:32px 38px; box-shadow:0 18px 50px rgba(25,35,45,.10); }
     .login-brand { font-size:30px; font-weight:800; color:#243746; letter-spacing:-1px; }
@@ -428,87 +442,104 @@ def render_login():
         with st.form("crimesphere_login", clear_on_submit=False):
             username = st.text_input("Username", placeholder="Enter your username", key="login_username")
             password = st.text_input("Password", type="password", placeholder="Enter your password", key="login_password")
-            camera = st.camera_input(
-                "Camera — capture your face",
-                key="login_face_camera",
-                help="Allow camera access and capture a clear, front-facing photo."
-            )
-            submitted = st.form_submit_button(
-                "Sign in with face verification",
-                type="primary",
-                use_container_width=True
-            )
+            camera = st.camera_input("Camera — capture your face", key="login_face_camera", help="Allow camera access and capture a clear, front-facing photo.")
+            submitted = st.form_submit_button("Sign in with face verification", type="primary", use_container_width=True)
 
         if submitted:
             clean_username = username.strip().lower()
             users = load_users()
             record = users.get(clean_username)
+            status = str(record.get("status", "APPROVED")).upper() if record else ""
 
             if not record or not record.get("active", True):
                 st.error("Invalid username/password or inactive account.")
+            elif status == "PENDING":
+                st.warning(_pending_status_message(record))
+            elif status == "REJECTED":
+                st.error("This registration was rejected. Login is not permitted.")
+            elif status != "APPROVED":
+                st.error("This account is not approved for login.")
             elif record.get("password_hash") != _password_hash(password):
                 st.error("Invalid username/password.")
             else:
-                # Existing built-in demo users may not have an enrolled face.
-                # They remain usable with password-only login. New accounts
-                # always have face data because registration requires the camera.
-                if record.get("face_enrolled") or get_face_image(clean_username):
-                    matched, message = _verify_registered_face(clean_username, camera)
-                    if matched:
-                        st.success(message)
-                        _finish_login(clean_username, record)
-                    else:
-                        st.error(message)
-                else:
-                    st.warning(
-                        "This account has no enrolled face yet. "
-                        "Password-only demo login is allowed for this built-in account. "
-                        "Create a new account to enable face verification."
-                    )
+                matched, message = _verify_registered_face(clean_username, camera)
+                if matched:
+                    st.success(message)
                     _finish_login(clean_username, record)
+                else:
+                    st.error(message)
 
         st.markdown(
             '<div class="login-note"><b>How it works</b><br>'
             '1. Enter your username and password. '
             '2. Capture your face using the laptop camera. '
-            '3. CrimeSphere detects the face and compares it with the enrolled face. '
-            '4. Access is granted only after successful verification.<br><br>'
-            '<b>Privacy:</b> the application stores an encrypted/protected face image in the configured MongoDB database for each enrolled account. '
-            'Use this only with authorized users and obtain appropriate consent.</div>',
+            '3. CrimeSphere compares the capture with the enrolled face stored for your account. '
+            '4. Access is granted only after successful face verification and account approval.<br><br>'
+            '<b>Registration:</b> Police Officers and Investigators require departmental approval. Exactly two Administrator accounts are supported: one for Police Department and one for CBI Department.</div>',
             unsafe_allow_html=True,
         )
 
     with register_tab:
         st.markdown("### Create CrimeSphere account")
-        st.caption(
-            "Registration requires a camera photo so the account can use face verification at login."
+        st.caption("Face enrollment is mandatory for every account, including both administrators.")
+
+        # Role intentionally lives OUTSIDE the form. Changing the role immediately
+        # reruns Streamlit and therefore rebuilds the Department widget correctly.
+        reg_role = st.selectbox(
+            "Role",
+            ["Police", "Investigator", "Admin"],
+            format_func=lambda r: ROLE_LABEL[r],
+            key="registration_role_selector",
         )
+
         with st.form("crimesphere_registration", clear_on_submit=False):
             c1, c2 = st.columns(2)
             with c1:
-                reg_user_id = st.text_input("User ID", placeholder="e.g. USR-001", key="reg_user_id")
-                reg_username = st.text_input("Username", placeholder="e.g. investigator01", key="reg_username")
+                reg_user_id = st.text_input("User ID", placeholder="e.g. POL-002 / INV-002 / ADM-002", key="reg_user_id")
+                reg_username = st.text_input("Username", placeholder="e.g. officer02", key="reg_username")
                 reg_full_name = st.text_input("Full name", placeholder="Enter full name", key="reg_full_name")
             with c2:
                 reg_email = st.text_input("Email", placeholder="name@example.com", key="reg_email")
-                reg_role = st.selectbox(
-                    "Role",
-                    ["Police", "Investigator", "Admin"],
-                    format_func=lambda r: ROLE_LABEL[r],
-                    key="reg_role",
-                )
-            reg_password = st.text_input("Password", type="password", key="reg_password")
-            reg_confirm = st.text_input("Confirm password", type="password", key="reg_confirm")
-            reg_camera = st.camera_input(
-                "Camera — capture enrollment photo",
-                key="register_face_camera",
-                help="Use good lighting, look directly at the camera, and keep one face visible."
-            )
-            reg_submitted = st.form_submit_button(
-                "Create account + enroll face",
-                type="primary",
-                use_container_width=True,
-            )
+
+                if reg_role == "Admin":
+                    reg_department = st.selectbox(
+                        "Department",
+                        ADMIN_DEPARTMENTS,
+                        key="reg_department_admin",
+                    )
+                elif reg_role == "Police":
+                    st.selectbox(
+                        "Department",
+                        ["Police Department"],
+                        key="reg_department_police",
+                        disabled=True,
+                    )
+                    reg_department = "Police Department"
+                else:
+                    st.selectbox(
+                        "Department",
+                        ["CBI Department"],
+                        key="reg_department_investigator",
+                        disabled=True,
+                    )
+                    reg_department = "CBI Department"
+
+                reg_password = st.text_input("Password", type="password", key="reg_password")
+                reg_confirm = st.text_input("Confirm password", type="password", key="reg_confirm")
+
+            st.markdown("### Professional details")
+            st.caption("These details are common to every CrimeSphere user.")
+            p1, p2 = st.columns(2)
+            with p1:
+                reg_service = st.text_input("Service / Employee / Badge Number", key="reg_service")
+                reg_designation = st.text_input("Rank / Designation", placeholder="e.g. SI / Inspector / Officer", key="reg_designation")
+                reg_office = st.text_input("Office / Station / Branch", key="reg_office")
+            with p2:
+                reg_district = st.text_input("District", key="reg_district")
+                reg_state = st.text_input("State", key="reg_state")
+
+            reg_camera = st.camera_input("Camera — capture enrollment photo", key="register_face_camera", help="Use good lighting, look directly at the camera, and keep one face visible.")
+            reg_submitted = st.form_submit_button("Create account + enroll face", type="primary", use_container_width=True)
 
         if reg_submitted:
             users = load_users()
@@ -524,65 +555,95 @@ def render_login():
                 st.error("Username already exists.")
             elif any(str(u.get("user_id", "")).strip().lower() == clean_user_id.lower() for u in users.values()):
                 st.error("User ID already exists.")
-            elif any(str(u.get("email", "")).strip().lower() == clean_email for u in users.values()):
+            elif clean_email and any(str(u.get("email", "")).strip().lower() == clean_email for u in users.values()):
                 st.error("Email already exists.")
             else:
-                valid, message = _validate_registration(
-                    clean_username, clean_email, reg_password, reg_confirm, reg_role
-                )
+                valid, message = _validate_registration(clean_username, clean_email, reg_password, reg_confirm, reg_role)
                 if not valid:
                     st.error(message)
+                elif not reg_service.strip():
+                    st.error("Service / Employee / Badge Number is required.")
+                elif not reg_designation.strip():
+                    st.error("Rank / Designation is required.")
+                elif not reg_office.strip():
+                    st.error("Office / Station / Branch is required.")
+                elif not reg_district.strip():
+                    st.error("District is required.")
+                elif not reg_state.strip():
+                    st.error("State is required.")
                 elif reg_camera is None:
                     st.error("Camera capture is required for face enrollment.")
+                elif reg_role == "Admin" and _admin_count(users) >= 2:
+                    st.error("The system already has the maximum of two administrators. No third Admin can be registered.")
+                elif reg_role == "Admin" and _department_admin_exists(users, reg_department):
+                    st.error(f"An Admin for {reg_department} already exists. Only one Admin is allowed for each department.")
+                elif reg_role in ("Police", "Investigator") and not _find_department_admin(users, reg_department):
+                    st.error(f"No approved Admin exists for {reg_department} yet. Register that department's Admin first.")
                 else:
-                    # Verify that a face can actually be detected before
-                    # creating the account.
                     face, face_error = _camera_bytes_to_face(reg_camera)
                     if face_error:
                         st.error(face_error)
                     else:
-                        # Store the face first. The account is only created after
-                        # biometric enrollment succeeds, so we never leave a
-                        # MongoDB user record without its required face data.
-                        ok, save_error = _save_registered_face(
-                            clean_username,
-                            reg_camera,
-                        )
-
+                        ok, save_error = _save_registered_face(clean_username, reg_camera)
                         if not ok:
                             st.error(save_error)
                         else:
-                            users[clean_username] = {
+                            if reg_role == "Admin":
+                                status = "APPROVED"
+                                approval_admin = ""
+                                admin_slot = 1 if _admin_count(users) == 0 else 2
+                            else:
+                                status = "PENDING"
+                                approval_admin = _find_department_admin(users, reg_department)
+                                admin_slot = None
+
+                            now = datetime.now().isoformat(timespec="seconds")
+                            record = {
                                 "user_id": clean_user_id,
                                 "full_name": reg_full_name.strip(),
                                 "email": clean_email,
                                 "password_hash": _password_hash(reg_password),
                                 "role": reg_role,
-                                "active": True,
+                                "department": reg_department,
+                                "service_employee_badge": reg_service.strip(),
+                                "rank_designation": reg_designation.strip(),
+                                "office_station_branch": reg_office.strip(),
+                                "district": reg_district.strip(),
+                                "state": reg_state.strip(),
+                                "active": True if status == "APPROVED" else True,
                                 "built_in": False,
                                 "face_enrolled": True,
-                                "face_enrolled_at": datetime.now().isoformat(timespec="seconds"),
+                                "face_enrolled_at": now,
+                                "status": status,
+                                "approval_admin": approval_admin,
+                                "submitted_at": now,
+                                "approved_by": clean_username if reg_role == "Admin" else "",
+                                "approved_at": now if reg_role == "Admin" else "",
                             }
+                            if admin_slot is not None:
+                                record["admin_slot"] = admin_slot
 
+                            users[clean_username] = record
                             try:
                                 save_users(users)
-                                st.success(
-                                    f"Account '{clean_username}' created successfully. "
-                                    "You can now sign in using password + face verification."
-                                )
+                                if reg_role in ("Police", "Investigator"):
+                                    create_notification(
+                                        approval_admin,
+                                        "REGISTRATION_PENDING",
+                                        f"New {ROLE_LABEL[reg_role]} registration from {reg_full_name.strip()} ({clean_username}) requires approval.",
+                                        clean_username,
+                                    )
+                                    st.success(f"Registration submitted successfully. Your account is PENDING until {approval_admin} approves it. You cannot sign in yet.")
+                                else:
+                                    st.success(f"Administrator account created successfully for {reg_department}. Face enrollment completed. You can now sign in using password + face verification.")
                             except Exception as exc:
-                                # If account creation fails after face storage,
-                                # remove the biometric record to keep the two stores consistent.
                                 try:
                                     delete_face(clean_username)
                                 except Exception:
                                     pass
                                 st.error(f"Account could not be created: {exc}")
 
-    st.caption(
-        "For production deployment, use HTTPS, secure biometric storage, a proper password "
-        "hash (Argon2/bcrypt), and a managed database/object store rather than local files."
-    )
+    st.caption("Face authentication is a prototype biometric control. Use only with authorized users and appropriate consent.")
 
 
 # Authenticate before loading the investigation workspace.
@@ -1850,6 +1911,18 @@ with profile_col:
 
         if st.button("🚪 Logout", key="profile_logout", use_container_width=True):
             _logout()
+
+
+def _logout():
+    """Clear authenticated session and return to login."""
+    for key in list(st.session_state.keys()):
+        st.session_state.pop(key, None)
+    st.session_state.authenticated = False
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+    st.rerun()
 
 if st.session_state.sidebar_collapsed:
     st.markdown(
@@ -4229,46 +4302,94 @@ def render_reports_ai():
 # ADMIN — USER MANAGEMENT
 # ============================================================
 
+def render_admin_notification_banner():
+    if not is_admin():
+        return
+    try:
+        unread = get_notifications(st.session_state.get("username", ""), unread_only=True)
+    except Exception:
+        unread = []
+    if unread:
+        st.info(f"🔔 {len(unread)} new registration notification(s) require your review. Open Settings → User & Access Management.")
+
+
 def render_admin_user_management():
     if st.session_state.get("role") != "Admin":
         st.error("Administrator access required.")
         return
-    st.markdown("### User & Access Management")
-    st.caption("Category A administrators can create and deactivate Category B accounts and change account roles.")
+    username = st.session_state.get("username", "")
     users = load_users()
-    rows = []
-    for uname, rec in users.items():
-        rows.append({"Username": uname, "Category": ROLE_CATEGORY.get(rec.get("role"), ""), "Role": rec.get("role", ""), "Active": bool(rec.get("active", True))})
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    current_admin = users.get(username, {})
+    department = current_admin.get("department", "")
 
-    with st.expander("Create / update user", expanded=False):
-        with st.form("admin_user_form"):
-            uname = st.text_input("Username").strip().lower()
-            new_password = st.text_input("Password", type="password")
-            role = st.selectbox("Role", ["Admin", "Police", "Investigator"])
-            active = st.checkbox("Account active", value=True)
-            save = st.form_submit_button("Save user", type="primary")
-        if save:
-            if not re.fullmatch(r"[a-zA-Z0-9._-]{3,40}", uname):
-                st.error("Username must be 3–40 characters and use only letters, numbers, dot, underscore or hyphen.")
-            elif len(new_password) < 8:
-                st.error("Password must contain at least 8 characters.")
-            else:
-                users[uname] = {"password_hash": _password_hash(new_password), "role": role, "active": active}
-                save_users(users)
-                st.success(f"User '{uname}' saved as {ROLE_LABEL[role]}.")
+    st.markdown("### User & Access Management")
+    st.caption(f"You are the {department} administrator. You can approve or reject registrations for your department only.")
+
+    try:
+        notifications = get_notifications(username, unread_only=True)
+    except Exception:
+        notifications = []
+    if notifications:
+        st.info(f"🔔 {len(notifications)} pending notification(s) for {department}.")
+        for n in notifications:
+            st.write(f"**{n.get('message', 'New registration requires review.')}**")
+            nid = n.get("notification_id")
+            if nid and st.button("Mark as read", key=f"read_notification_{nid}"):
+                mark_notification_read(nid)
                 st.rerun()
 
+    pending = [(uname, rec) for uname, rec in users.items()
+               if rec.get("role") in ("Police", "Investigator")
+               and str(rec.get("status", "APPROVED")).upper() == "PENDING"
+               and rec.get("approval_admin") == username]
+    st.metric("Pending registrations", len(pending))
+
+    if pending:
+        for uname, rec in pending:
+            with st.expander(f"🟡 {rec.get('full_name', uname)} — {ROLE_LABEL.get(rec.get('role'), rec.get('role'))} — {uname}", expanded=True):
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.write(f"**User ID:** {rec.get('user_id', '')}")
+                    st.write(f"**Email:** {rec.get('email', '')}")
+                    st.write(f"**Department:** {rec.get('department', '')}")
+                    st.write(f"**Service / Employee / Badge:** {rec.get('service_employee_badge', '')}")
+                with c2:
+                    st.write(f"**Rank / Designation:** {rec.get('rank_designation', '')}")
+                    st.write(f"**Office / Station / Branch:** {rec.get('office_station_branch', '')}")
+                    st.write(f"**District:** {rec.get('district', '')}")
+                    st.write(f"**State:** {rec.get('state', '')}")
+                    st.write(f"**Submitted:** {rec.get('submitted_at', '')}")
+                a, r = st.columns(2)
+                with a:
+                    if st.button("✅ Approve", key=f"approve_{uname}", use_container_width=True):
+                        rec.update({"status": "APPROVED", "approved_by": username, "approved_at": datetime.now().isoformat(timespec="seconds"), "active": True})
+                        save_users(users)
+                        st.success(f"{uname} has been approved.")
+                        st.rerun()
+                with r:
+                    if st.button("❌ Reject", key=f"reject_{uname}", use_container_width=True):
+                        rec.update({"status": "REJECTED", "approved_by": username, "approved_at": datetime.now().isoformat(timespec="seconds"), "active": False})
+                        save_users(users)
+                        st.warning(f"{uname} has been rejected. Login is blocked.")
+                        st.rerun()
+    else:
+        st.success(f"No pending registrations for {department}.")
+
+    st.markdown("### Registered accounts")
+    rows = []
+    for uname, rec in users.items():
+        rows.append({"Username": uname, "Full Name": rec.get("full_name", ""), "Role": ROLE_LABEL.get(rec.get("role"), rec.get("role", "")), "Department": rec.get("department", ""), "Status": rec.get("status", "APPROVED"), "Face Enrolled": "Yes" if rec.get("face_enrolled") else "No", "Active": "Yes" if rec.get("active", True) else "No"})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("Exactly two administrator slots are supported: one Police Department administrator and one CBI Department administrator.")
+
     with st.expander("Deactivate / reactivate account", expanded=False):
-        candidates = [u for u in users if u != st.session_state.get("username")]
+        candidates = [u for u in users if u != username]
         if candidates:
             target = st.selectbox("Account", candidates, key="admin_target_user")
-            current = users[target]
             if st.button("Toggle active status", key="admin_toggle_user"):
-                current["active"] = not bool(current.get("active", True))
+                users[target]["active"] = not bool(users[target].get("active", True))
                 save_users(users)
-                st.success(f"{target} is now {'active' if current['active'] else 'inactive'}.")
                 st.rerun()
         else:
             st.info("No other accounts are available to manage.")
@@ -4767,6 +4888,11 @@ def render_individual_investigation():
         "Analytical scores and relationships are investigative associations only. "
         "They are NOT proof of guilt and NOT legal determinations."
     )
+
+# ADMIN NOTIFICATION BANNER
+# Must run after all helper/function definitions (including is_admin).
+# ============================================================
+render_admin_notification_banner()
 
 # ROUTER
 # ============================================================
