@@ -275,7 +275,7 @@ def _camera_bytes_to_face(camera_file):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         # Use the Haar cascade bundled with the CrimeSphere project.
-        # This is portable across teammates' machines and deployments.
+        # This works even when OpenCV's own haarcascades package path is unavailable.
         cascade_path = BASE_DIR / "models" / "haarcascade_frontalface_default.xml"
         detector = cv2.CascadeClassifier(str(cascade_path))
 
@@ -658,6 +658,28 @@ if not st.session_state.get("authenticated", False):
 if not st.session_state.get("authenticated", False):
     render_login()
     st.stop()
+
+# Admin notification banner must be defined before it is called.
+# It intentionally checks the session role directly so it does not depend
+# on helper functions defined later in this large application file.
+def render_admin_notification_banner():
+    if st.session_state.get("role") != "Admin":
+        return
+    try:
+        unread = get_notifications(
+            st.session_state.get("username", ""),
+            unread_only=True,
+        )
+    except Exception:
+        unread = []
+    if unread:
+        st.info(
+            f"🔔 {len(unread)} new registration notification(s) require "
+            "your review. Open Settings → User & Access Management."
+        )
+
+
+render_admin_notification_banner()
 
 # ============================================================
 # THEME
@@ -1882,37 +1904,6 @@ auth_token = st.session_state.get("auth_token") or st.query_params.get("auth") o
 # TOP-RIGHT CLICKABLE USER PROFILE WITH AVATAR
 # ============================================================
 
-current_username = st.session_state.get("username", "User")
-current_role = st.session_state.get("role", "Police")
-current_role_label = ROLE_LABEL.get(current_role, current_role)
-
-profile_initial = current_username[:1].upper() if current_username else "U"
-
-profile_spacer, profile_col = st.columns([8, 2])
-
-with profile_col:
-    with st.popover(
-        f"👤  {current_username}",
-        use_container_width=True
-    ):
-
-        st.markdown(
-            f'<div style="display:flex;align-items:center;gap:12px;padding:8px 4px 14px 4px;"><div style="width:48px;height:48px;border-radius:50%;background:#243746;color:white;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;">{html.escape(profile_initial)}</div><div><div style="font-size:15px;font-weight:700;color:#243746;">{html.escape(current_username)}</div><div style="font-size:12px;color:#68737b;margin-top:3px;">{html.escape(current_role_label)}</div></div></div>',
-            unsafe_allow_html=True
-        )
-
-        st.divider()
-
-        st.markdown("**👤 Profile**")
-        st.write(f"**Username:** {current_username}")
-        st.write(f"**Role:** {current_role_label}")
-
-        st.divider()
-
-        if st.button("🚪 Logout", key="profile_logout", use_container_width=True):
-            _logout()
-
-
 def _logout():
     """Clear authenticated session and return to login."""
     for key in list(st.session_state.keys()):
@@ -1923,6 +1914,62 @@ def _logout():
     except Exception:
         pass
     st.rerun()
+
+
+current_username = st.session_state.get("username", "User")
+current_role = st.session_state.get("role", "Police")
+current_role_label = ROLE_LABEL.get(current_role, current_role)
+
+# Load the registered profile from MongoDB.
+_current_users = load_users()
+_current_profile = _current_users.get(current_username, {})
+
+current_full_name = str(
+    _current_profile.get("full_name")
+    or st.session_state.get("full_name")
+    or current_username
+).strip()
+
+current_user_id = str(
+    _current_profile.get("user_id")
+    or st.session_state.get("user_id")
+    or "Not available"
+).strip()
+
+current_department = str(
+    _current_profile.get("department")
+    or st.session_state.get("department")
+    or "Not available"
+).strip()
+
+profile_initial = current_full_name[:1].upper() if current_full_name else "U"
+
+profile_spacer, profile_col = st.columns([8, 2])
+
+with profile_col:
+    with st.popover(
+        f"👤  {current_full_name}",
+        use_container_width=True
+    ):
+
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:12px;padding:8px 4px 14px 4px;"><div style="width:48px;height:48px;border-radius:50%;background:#243746;color:white;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;">{html.escape(profile_initial)}</div><div><div style="font-size:15px;font-weight:700;color:#243746;">{html.escape(current_full_name)}</div><div style="font-size:12px;color:#68737b;margin-top:3px;">{html.escape(current_role_label)}</div></div></div>',
+            unsafe_allow_html=True
+        )
+
+        st.divider()
+
+        st.markdown("**👤 Profile**")
+        st.write(f"**Name:** {current_full_name}")
+        st.write(f"**User ID:** {current_user_id}")
+        st.write(f"**Username:** {current_username}")
+        st.write(f"**Role:** {current_role_label}")
+        st.write(f"**Department:** {current_department}")
+
+        st.divider()
+
+        if st.button("🚪 Logout", key="profile_logout", use_container_width=True):
+            _logout()
 
 if st.session_state.sidebar_collapsed:
     st.markdown(
@@ -4302,17 +4349,6 @@ def render_reports_ai():
 # ADMIN — USER MANAGEMENT
 # ============================================================
 
-def render_admin_notification_banner():
-    if not is_admin():
-        return
-    try:
-        unread = get_notifications(st.session_state.get("username", ""), unread_only=True)
-    except Exception:
-        unread = []
-    if unread:
-        st.info(f"🔔 {len(unread)} new registration notification(s) require your review. Open Settings → User & Access Management.")
-
-
 def render_admin_user_management():
     if st.session_state.get("role") != "Admin":
         st.error("Administrator access required.")
@@ -4888,11 +4924,6 @@ def render_individual_investigation():
         "Analytical scores and relationships are investigative associations only. "
         "They are NOT proof of guilt and NOT legal determinations."
     )
-
-# ADMIN NOTIFICATION BANNER
-# Must run after all helper/function definitions (including is_admin).
-# ============================================================
-render_admin_notification_banner()
 
 # ROUTER
 # ============================================================
